@@ -1,0 +1,131 @@
+pipeline {
+    agent {
+        label "${params.NODE_SELECTION}"
+    }
+    
+    environment {
+        AWS_CREDENTIALS = credentials('aws-credentials')
+        AWS_DEFAULT_REGION = 'us-east-1'
+        TF_IN_AUTOMATION = '1'
+    }
+    
+    parameters {
+        choice(
+            name: 'NODE_SELECTION',
+            choices: ['ubuntu-agent', 'built-in'],
+            description: 'Select the Jenkins node to run the pipeline'
+        )
+        string(name: 'INSTANCE_TYPE', defaultValue: 't2.nano', description: 'Instance Type')
+        // string(name: 'AMI_ID', defaultValue: 'ami-052cef01758351d39', description: 'AMI ID')
+        string(name: 'GIT_BRANCH', defaultValue: 'main', description: 'Git Branch')
+        string(name: 'EMAIL_RECIPIENTS', defaultValue: '', description: 'Email recipients (comma-separated)')
+        text(name: 'SSH_PUBLIC_KEY', defaultValue: '', description: 'SSH public key for EC2 instance access')
+        string(name: 'KEY_PAIR_NAME', defaultValue: 'terraform-key', description: 'Name for the EC2 key pair')
+    }
+    
+    stages {
+        stage('System Information') {
+            steps {
+                sh '''
+                    echo "System Information:"
+                    echo "-------------------"
+                    echo "Hostname: $(hostname)"
+                    echo "System: $(uname -a)"
+                    echo "Current Directory: $(pwd)"
+                    echo "Current User: $(whoami)"
+                    echo "Working Directory: $WORKSPACE"
+                    echo "Jenkins Node: $NODE_NAME"
+                    echo "Build Number: $BUILD_NUMBER"
+                    echo "Job Name: $JOB_NAME"
+                    echo "Selected Node: ''' + params.NODE_SELECTION + '''"
+                '''
+            }
+        }
+
+        stage('Prepare SSH Key') {
+            steps {
+                dir('IaC/Terraform') {
+                    writeFile file: 'public_key.pub', text: params.SSH_PUBLIC_KEY
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Terraform Init') {
+            steps {
+                dir('IaC/Terraform') {
+                    sh 'terraform init'
+                }
+            }
+        }
+        
+        stage('Terraform Plan') {
+            steps {
+                dir('IaC/Terraform') {
+                    sh """
+                    terraform plan \
+                        -var="instance_type=${params.INSTANCE_TYPE}" \
+                        -var="key_pair_name=${params.KEY_PAIR_NAME}" \
+                        -var="public_key_path=public_key.pub" \
+                        -out=tfplan
+                    """
+                }
+            }
+        }
+        
+        stage('Terraform Apply') {
+            steps {
+                dir('IaC/Terraform') {
+                    sh 'terraform apply -auto-approve tfplan'
+                }
+            }
+        }
+        
+        stage('Get Public IP') {
+            steps {
+                dir('IaC/Terraform') {
+                    script {
+                        env.PUBLIC_IP = sh(
+                            script: 'terraform output -raw public_ip',
+                            returnStdout: true
+                        ).trim()
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            emailext (
+                subject: "Infrastructure Deployment Successful",
+                body: """
+                    Infrastructure deployment completed successfully!
+                    
+                    Public IP of the new instance: ${env.PUBLIC_IP}
+                    Instance Type: ${params.INSTANCE_TYPE}
+                    AMI ID: ${params.AMI_ID}
+                    Key Pair Name: ${params.KEY_PAIR_NAME}
+                    
+                    You can connect to the instance using:
+                    ssh ubuntu@${env.PUBLIC_IP}
+                """,
+                to: params.EMAIL_RECIPIENTS,
+                from: "openlabfree@gmail.com"
+            )
+        }
+        failure {
+            emailext (
+                subject: "Infrastructure Deployment Failed",
+                body: "Infrastructure deployment failed. Please check Jenkins logs for details.",
+                to: params.EMAIL_RECIPIENTS,
+                from: "jenkins@yourdomain.com"
+            )
+        }
+    }
+}
